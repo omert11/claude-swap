@@ -104,11 +104,64 @@ def normalize_account_threshold(value: object) -> float:
     return pct
 
 
+#: Per-account switch priority bounds. Higher is preferred; 0 is the default
+#: every account without a stored priority reads as. Bounded only so a typo
+#: (an extra digit, a pasted timestamp) is refused rather than silently
+#: outranking every account the user meant to compare it with.
+ACCOUNT_PRIORITY_MIN = -100
+ACCOUNT_PRIORITY_MAX = 100
+
+
+def normalize_account_priority(value: object) -> int:
+    """Validate a per-account switch priority; raise ValueError if invalid.
+
+    The write-boundary twin of :func:`normalize_account_threshold`: strict at
+    set time, while the read side (``_policy_from_data``) degrades a bad
+    stored value to the default instead of raising.
+
+    Accepts ``int``, an integral ``float`` and an integer ``str`` (the CLI
+    hands over argv strings, so ``"-5"`` and ``"+3"`` parse). Rejects
+    ``bool`` (an ``int`` subclass) and any fractional value: priority is an
+    ordering, and ``2.5`` would read as a precision the ranking does not have.
+
+    Args:
+        value: The proposed priority.
+
+    Returns:
+        The priority as an ``int`` in ``[ACCOUNT_PRIORITY_MIN,
+        ACCOUNT_PRIORITY_MAX]``.
+
+    Raises:
+        ValueError: If the value is not an integer or falls outside the valid
+            range. The message always names the range.
+    """
+    range_text = (
+        f"must be an integer between {ACCOUNT_PRIORITY_MIN} and "
+        f"{ACCOUNT_PRIORITY_MAX}"
+    )
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"priority {range_text}, got {value!r}")
+    if isinstance(value, str):
+        try:
+            priority = int(value.strip())
+        except ValueError:
+            raise ValueError(f"priority {range_text}, got {value!r}") from None
+    elif isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"priority {range_text}, got {value!r}")
+        priority = int(value)
+    else:
+        priority = value
+    if not ACCOUNT_PRIORITY_MIN <= priority <= ACCOUNT_PRIORITY_MAX:
+        raise ValueError(f"priority {range_text}, got {priority}")
+    return priority
+
+
 @dataclass(frozen=True)
 class AccountPolicy:
     """Per-account auto-switch overrides, stored in the sequence record.
 
-    Its one knob is unset by default, so a fleet with no policy set behaves
+    Every knob is unset by default, so a fleet with no policy set behaves
     exactly as it did before this existed — the default-identity property
     the acceptance criteria assert throughout.
 
@@ -118,11 +171,19 @@ class AccountPolicy:
         on one shared account no longer means taxing the whole fleet with a
         global line set to the strictest member's.
 
+    ``priority``
+        Switch preference: among accounts the engine would accept as a
+        landing spot, a higher priority is taken first, and a healthy account
+        of higher priority than the active one is switched back to on its
+        own (the ``priority`` trigger). ``0`` is the default, and an account
+        whose stored record carries no ``priority`` key reads as ``0``.
+
     Frozen because ``AccountSnapshot`` is frozen — a mutable member would
     silently break that guarantee for the whole row.
     """
 
     threshold: float | None = None
+    priority: int = 0
 
 
 class Platform(Enum):

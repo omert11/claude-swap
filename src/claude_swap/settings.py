@@ -54,6 +54,16 @@ class AutoSwitchSettings:
     # Switch line for the 7-day window and every per-model scoped window.
     # None = ``threshold`` governs every window (the default, today's policy).
     weekly_threshold: float | None = None
+    # A softer line on the windows ``threshold`` governs, below it. Unset (the
+    # default) turns the two-line model off entirely. Set, an active account
+    # at/over its soft line moves voluntarily to an account of equal or
+    # higher priority still under ITS soft line (the ``soft`` trigger), and
+    # otherwise stays until the hard ``threshold``; the hard-switch ranking
+    # prefers candidates still under their soft line. Must sit below
+    # ``threshold``: an account whose hard line is at or under it (a lower
+    # per-account override, a lower session threshold) simply has no soft
+    # line of its own.
+    soft_threshold: float | None = None
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
     hysteresis_pct: float = 10.0
@@ -132,6 +142,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "weeklyThreshold", "weekly_threshold", "float", 50.0, 99.9,
             help="Switch line for the 7d and per-model windows (unset: threshold)",
+        ),
+        SettingSpec(
+            "autoswitch", "softThreshold", "soft_threshold", "float", 50.0, 99.9,
+            help="Soft switch line below threshold: prefer accounts still under it (unset: off)",
         ),
         SettingSpec(
             "autoswitch", "intervalSeconds", "interval_seconds", "float", 15.0, 3600.0,
@@ -427,6 +441,32 @@ def _read_raw_for_write(path: Path) -> dict:
     return raw
 
 
+def _check_line_order(backup_root: Path, spec: SettingSpec, value) -> None:
+    """Refuse a write that would put the soft line at or above the hard one.
+
+    The pair is checked against the OTHER key's effective value, so the order
+    of the two ``config set`` calls does not matter as long as the end state
+    is valid. Only the global pair is checked here; the engine treats any
+    account whose own hard line sits at or under the soft one as having no
+    soft line, so a per-account override can never invert the pair at run
+    time.
+    """
+    if spec.dotted == "autoswitch.softThreshold":
+        hard = load_settings(backup_root).threshold
+        if value >= hard:
+            raise ConfigError(
+                f"autoswitch.softThreshold must be below autoswitch.threshold "
+                f"({format_setting_value(hard)})"
+            )
+    elif spec.dotted == "autoswitch.threshold":
+        soft = load_settings(backup_root).soft_threshold
+        if soft is not None and value <= soft:
+            raise ConfigError(
+                f"autoswitch.threshold must be above autoswitch.softThreshold "
+                f"({format_setting_value(soft)}); lower or unset that first"
+            )
+
+
 def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     """Validate and persist one key for `cswap config set`; returns the value.
 
@@ -437,6 +477,7 @@ def set_setting(backup_root: Path, dotted_key: str, raw_value: str):
     """
     spec = setting_spec(dotted_key)
     value = parse_setting_value(spec, raw_value)
+    _check_line_order(backup_root, spec, value)
     path = settings_path(backup_root)
     raw = _read_raw_for_write(path)
     raw["schemaVersion"] = raw.get("schemaVersion", SETTINGS_SCHEMA_VERSION)
@@ -492,6 +533,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
     for attr, field in (
         ("threshold", "threshold"),
         ("weekly_threshold", "weekly_threshold"),
+        ("soft_threshold", "soft_threshold"),
         ("interval", "interval_seconds"),
         ("cooldown", "cooldown_seconds"),
         ("include_api_key_accounts", "include_api_key_accounts"),

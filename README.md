@@ -88,6 +88,7 @@ Let claude-swap watch your usage and switch for you. When the active account's 5
 cswap auto                     # foreground loop, polls every 60s
 cswap auto --threshold 80      # switch earlier
 cswap auto --weekly-threshold 97   # let the weekly window run higher before switching
+cswap auto --soft-threshold 60     # prefer accounts under 60%; run to the threshold only when none is
 cswap auto --model Fable       # also switch when the Fable weekly limit is hit
 cswap auto --once              # single check-and-switch, for cron/scripts
 cswap auto --dry-run           # log what it would do, never switch
@@ -106,6 +107,19 @@ cswap auto --strategy consume-first   # burn the soonest-resetting account first
 - An account whose refresh token has died is quarantined and reported until you either log in with it and re-run `cswap add --slot N`, or replace its stored credentials from a known-good export — a plain `cswap import backup.cswap` replaces dead-token slots on its own (`--force` is still required to replace other existing accounts; note a stale export can carry an already-superseded token). API-key accounts are never rotated onto unless you pass `--include-api-key-accounts`.
 - To hold an account out of rotation yourself — a work account you don't want touched, one you're resting — run `cswap disable <num|email>`; `cswap enable <num|email>` puts it back. Disabled accounts are skipped by auto-switch, bare `cswap switch`, and the `best` / `next-available` strategies, but stay fully managed and remain a valid explicit `cswap switch <num|email>` target. They show a `(disabled)` marker in `cswap list`, in the [TUI](#interactive-dashboard-tui), and in the [menu bar](#menu-bar-macos) — both of which also let you toggle the state in place (TUI: menu → *Disable / enable account…*; menu bar: *Disable / enable account*).
 - **Per-account threshold.** `cswap threshold <num|email> <pct>` gives one account its own switch-away line (50–99.9) in place of the global one: auto-switch leaves that account when *its* line is reached and prefers candidates still under *theirs*, with ranking and the hysteresis margin counting room under each account's own line rather than raw headroom. Like the global threshold it is a switch-away line, not a hard cap — with nothing under its line, or the active account at its limit, it still lands somewhere rather than stall. With a weekly line set, the override applies to the 5-hour window only. Accounts without one keep the global threshold. `cswap threshold` alone lists the default and every override, `--unset` clears one, and the [TUI](#interactive-dashboard-tui) shows a `th 85%` badge.
+- **Per-account priority.** `cswap priority <num|email> <int>` (−100 to 100, default 0) says which accounts to use first. Among the candidates auto-switch would accept anyway, the highest priority is taken first, then the strategy decides — on proactive, consume-first, at-limit and failover switches alike. Priority never makes an account acceptable that is over its own lines: an account at its line still loses to a healthy one, and when *every* account is over its line the engine keeps picking whichever comes back soonest. While the active account is under its line, a candidate of strictly higher priority that is under its own line by at least `hysteresisPct` points, on freshly fetched usage, is switched to proactively (trigger `priority`, inside the cooldown). The consume-first nudge never moves to a lower priority. `cswap priority` alone lists every account highest first, `--unset` (or `0`) clears one, `--list --json` rows carry `"priority"` when set, and the [TUI](#interactive-dashboard-tui) shows a `prio +10` badge.
+- **Soft line** (`--soft-threshold 60`, or `cswap config set autoswitch.softThreshold 60`; must be below `threshold`, off by default). A second, softer line on the windows `threshold` governs. Once the active account reaches its soft line it moves to an account of equal or higher priority still under *its* soft line by `hysteresisPct` points (trigger `soft`, inside the cooldown); with none, it stays until the hard `threshold`. The hard-switch ranking is then priority, then candidates still under their soft line, then the strategy, and a `priority` return asks its target to be under its soft line. An account whose own hard line is at or under the soft one has no soft line.
+
+  A personal account (1) plus Team accounts (2-6) that you want spent first — Teams rotate among themselves up to 60%, then run to 90%, and only then does account 1 take over; a Team whose 5-hour window resets is taken straight back:
+
+  ```console
+  $ for n in 2 3 4 5 6; do cswap priority $n 10; done
+  $ cswap config set autoswitch.threshold 90
+  $ cswap config set autoswitch.softThreshold 60
+  $ cswap config set autoswitch.weeklyThreshold 97
+  ```
+
+  Every move needs `hysteresisPct` points of room on its target, so "up to 90%" ends once no Team has that much room left under 90, and a Team is returned to once it is that far under 60; lower `hysteresisPct` to tighten both.
 - By default only the account-wide 5h/7d windows drive switching. If you work on one model and hit its **weekly per-model limit** first (e.g. Fable), add `--model Fable` (or `cswap config set autoswitch.model Fable`) to fold that model's window into the decision, so it switches off an account whose model quota is spent even while its 5h/7d windows still have room.
   - **Model names** are Anthropic's own per-model `display_name`s, matched case-insensitively. The exact strings for your accounts are the per-model rows in `cswap list` (e.g. a line reading `Fable: 100%`).
 
@@ -198,6 +212,9 @@ cswap enable 2                  # Return a disabled account to rotation
 cswap threshold 2 85            # Switch away from account 2 at 85%, not the global default
 cswap threshold 2 --unset       # Return account 2 to the global default
 cswap threshold                 # Show the global default and every per-account override
+cswap priority 2 10             # Prefer account 2 in auto-switch (higher first, default 0)
+cswap priority 2 --unset        # Return account 2 to the default priority
+cswap priority                  # Show every account's priority
 cswap alias 2 dev               # Give an account a short alias (usable anywhere NUM|EMAIL is)
 cswap alias 2 --unset           # Remove an account's alias
 cswap alias                     # List all aliases
@@ -282,6 +299,7 @@ cswap config                              # list effective settings ("(default)"
 cswap config get autoswitch.threshold
 cswap config set autoswitch.threshold 80  # validated: rejects out-of-range values loudly
 cswap config set autoswitch.weeklyThreshold 97  # own switch line for the 7-day/per-model windows
+cswap config set autoswitch.softThreshold 60    # soft line: prefer accounts still under it
 cswap config set autoswitch.model Fable   # per-model switching (see "auto"); Fable,Opus for several
 cswap config set updates.check false      # no daily PyPI lookup for the "newer version" hint
 cswap config unset autoswitch.threshold   # back to the default
@@ -351,7 +369,7 @@ cswap switch 2 --json
 
 Every payload carries a `schemaVersion` (currently `1`); on a handled error stdout is `{"schemaVersion":1,"error":{...}}` with a non-zero exit code. `--switch`/`--switch-to` report `{"switched": true|false, "from": …, "to": …, "reason": …}`.
 
-Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Whenever `usage` is null but a last-known measurement exists — data too old to drive a decision (`usageStatus` stays `unavailable`), or a row in a non-`ok` state such as `token_expired` — additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. When `usage` is null and nothing else explains it (`usageStatus` is `unavailable`), an additive `usageError` names the last fetch failure by kind (e.g. `http-429`, `timeout`) and, while the cache is backing off from it, `usageRetryAt` gives the time of the next attempt. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `cswap disable` carries an additive `"disabled": true` on its row (absent otherwise). Per-account policy follows the same convention: a row carries `"threshold": 85.0` once one is set with `cswap threshold` — absent otherwise, so a fleet that never sets a policy emits rows identical to before.
+Usage is served from a per-account cache: when the usage API is briefly unreachable, the last-known numbers are shown instead of nothing (the human view marks them with their age, e.g. `· 2m ago`). Rows with decision-trusted usage carry additive `usageFetchedAt`/`usageAgeSeconds` fields telling you how old the measurement is. Whenever `usage` is null but a last-known measurement exists — data too old to drive a decision (`usageStatus` stays `unavailable`), or a row in a non-`ok` state such as `token_expired` — additive `lastGoodUsage`/`lastGoodFetchedAt`/`lastGoodAgeSeconds` fields preserve the human display without making the account actionable. When `usage` is null and nothing else explains it (`usageStatus` is `unavailable`), an additive `usageError` names the last fetch failure by kind (e.g. `http-429`, `timeout`) and, while the cache is backing off from it, `usageRetryAt` gives the time of the next attempt. These fields apply to list rows and the managed active row from `status --json`. An account held out of rotation with `cswap disable` carries an additive `"disabled": true` on its row (absent otherwise). Per-account policy follows the same convention: a row carries `"threshold": 85.0` once one is set with `cswap threshold`, and `"priority": 10` once one is set with `cswap priority` — each absent otherwise, so a fleet that never sets a policy emits rows identical to before.
 
 A row carries an additive `loginExpiresAt` (ISO-8601 UTC) when the stored login records when its refresh token expires, which is the moment the slot will need a fresh `/login` and `cswap add --slot N`; a script can warn a few days ahead instead of discovering `relogin_required`. Absent when Claude Code recorded no such date for that login.
 

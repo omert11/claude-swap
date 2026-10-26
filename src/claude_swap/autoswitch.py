@@ -29,6 +29,17 @@ whose refresh token is dead gets quarantined instead of activated. When the
 active account's own usage becomes unreadable for ``unhealthy_ticks``
 consecutive ticks, the engine fails over to any healthy candidate.
 
+Two optional layers sit on top, both inert until configured. Per-account
+**priority** (``cswap priority``) orders the candidates the gates above
+already accept — higher first, never admitting one they reject — and, while
+the active account is under its own line, switches back to a healthy
+account of strictly higher priority (the ``priority`` trigger). A **soft
+line** (``settings.soft_threshold``) below the hard ``threshold`` makes an
+active account at/over it move to an account of equal or higher priority
+still under its own soft line (the ``soft`` trigger), and otherwise stay
+until the hard line; the hard-switch ranking then prefers candidates still
+under their soft line.
+
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
 read-modify-write under a dedicated file lock.
@@ -54,6 +65,7 @@ from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import SCHEMA_VERSION, USAGE_TOKEN_EXPIRED
 from claude_swap.lines import BindingWindow, binding_window, window_line
 from claude_swap.locking import FileLock
+from claude_swap.models import AccountPolicy
 from claude_swap.poll_policy import (
     ESCALATION_MARGIN_PCT,
     RESET_SLACK_S,
@@ -156,6 +168,17 @@ HORIZON_HEADROOM_RATIO = 2.0
 # sit where quota returns first, however far out — rather than parking on
 # whichever account we happen to hold.
 SPENT_HEADROOM_PCT = 3.0
+
+# Triggers that move while the active account is still UNDER its hard line:
+# nothing forces them, so they respect the cooldown, decide on the stored
+# snapshot only provisionally (the collector does not escalate this far from
+# the hard line) and re-verify on a refetch before committing, and never fall
+# back to an API-key account. `consume-first` is the original member;
+# `priority` and `soft` reuse its two-phase commit unchanged.
+_VOLUNTARY_TRIGGERS = ("consume-first", "priority", "soft")
+# Triggers the cooldown floor applies to: the voluntary ones plus `proactive`.
+# At-limit and failover are escapes and bypass it.
+_COOLDOWN_TRIGGERS = ("proactive", *_VOLUNTARY_TRIGGERS)
 
 
 def _recovery_is_useful(
@@ -404,7 +427,10 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    # "proactive" | "at-limit" | "failover" | "consume-first" | "priority" |
+    # "soft". The last two are voluntary moves made while the active account
+    # is still under its hard line (see `_voluntary_trigger`).
+    trigger: str
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -665,6 +691,18 @@ class ThresholdMap(dict):
 
     def __missing__(self, key: str) -> float:
         return self.default
+
+
+class PriorityMap(dict):
+    """Switch priority per account number — total, like ``ThresholdMap``.
+
+    Every account without a stored priority (including one not in the fleet
+    at all) reads ``0``, so the ranking subscripts directly and a fleet that
+    never set a priority ranks exactly as it did before priorities existed.
+    """
+
+    def __missing__(self, key: str) -> int:
+        return 0
 
 
 def _every_account_above_threshold(
@@ -983,7 +1021,9 @@ class AutoSwitchEngine:
             return TickOutcome.ERROR
 
     def _resolve_thresholds(
-        self, settings: AutoSwitchSettings | None = None
+        self,
+        settings: AutoSwitchSettings | None = None,
+        policies: Mapping[str, AccountPolicy] | None = None,
     ) -> ThresholdMap:
         """The effective threshold for every account, resolved once per tick.
 
@@ -995,15 +1035,34 @@ class AutoSwitchEngine:
 
         The ``settings`` argument exists so a tick resolves against the same
         snapshot it gates with, even if ``apply_threshold()`` lands mid-tick.
+        ``policies`` lets the tick hand in the one store read it also resolves
+        priorities from, so both maps describe the same moment.
         """
         effective = settings or self.settings
+        if policies is None:
+            policies = self.switcher.account_policies()
         return ThresholdMap(
             {
                 num: policy.threshold
-                for num, policy in self.switcher.account_policies().items()
+                for num, policy in policies.items()
                 if policy.threshold is not None
             },
             effective.threshold,
+        )
+
+    def _resolve_priorities(
+        self, policies: Mapping[str, AccountPolicy] | None = None
+    ) -> PriorityMap:
+        """Every account's switch priority, resolved once per tick.
+
+        Threaded down as a parameter for the same reason as the threshold
+        map: ``_rank_candidates`` is pure and runs twice under the two-phase
+        commit, so it must not read the store itself.
+        """
+        if policies is None:
+            policies = self.switcher.account_policies()
+        return PriorityMap(
+            {num: policy.priority for num, policy in policies.items() if policy.priority}
         )
 
     def _min_effective_threshold(
@@ -1026,7 +1085,12 @@ class AutoSwitchEngine:
             thresholds[num]
             for num in self.switcher.switchable_account_numbers()
         ]
-        return min(values) if values else self.settings.threshold
+        lowest = min(values) if values else self.settings.threshold
+        # A soft line is a switch line too: the soft trigger fires on it, so
+        # collection must already be tight around it. Same direction as the
+        # minimum above — it can only make collection earlier.
+        soft = self.settings.soft_threshold
+        return min(lowest, soft) if soft is not None else lowest
 
     def _refresh_poll_policy_inputs(self, thresholds: ThresholdMap) -> None:
         """Re-pin poll cadence from this tick's threshold map.
@@ -1177,7 +1241,10 @@ class AutoSwitchEngine:
         # Every gate below reads `thresholds[...]`; the map is total, so an
         # account absent from it (never sequenced, just removed) reads the
         # global rather than raising mid-tick.
-        thresholds = self._resolve_thresholds(settings)
+        policies = self.switcher.account_policies()
+        thresholds = self._resolve_thresholds(settings, policies)
+        # Priorities from the same read, threaded down the same way.
+        priorities = self._resolve_priorities(policies)
         # Cadence follows the same snapshot, and does so BEFORE collection is
         # planned below — see `_refresh_poll_policy_inputs`.
         self._refresh_poll_policy_inputs(thresholds)
@@ -1242,7 +1309,26 @@ class AutoSwitchEngine:
                 if active_binding is not None
                 else (100.0 - active_headroom) < thresholds[current]
             )
-            if below:
+            # A voluntary move is only ever asked about while the active is
+            # under its hard line; with no priorities and no soft line it is
+            # never asked at all (see `_voluntary_trigger`).
+            voluntary = (
+                self._voluntary_trigger(
+                    current,
+                    quarantined,
+                    usage,
+                    headroom,
+                    active_headroom,
+                    settings,
+                    thresholds,
+                    priorities,
+                )
+                if below
+                else None
+            )
+            if voluntary is not None:
+                trigger = voluntary
+            elif below:
                 if settings.strategy != "consume-first":
                     self._emit(
                         NoSwitchEvent(
@@ -1313,7 +1399,7 @@ class AutoSwitchEngine:
                 return TickOutcome.NO_ACTION
             trigger = "failover"
 
-        if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+        if trigger in _COOLDOWN_TRIGGERS and self._in_cooldown(state):
             self._emit(NoSwitchEvent(reason="cooldown"))
             return TickOutcome.NO_ACTION
 
@@ -1454,9 +1540,10 @@ class AutoSwitchEngine:
             settings=settings,
             now=decided_now,
             thresholds=thresholds,
+            priorities=priorities,
         )
 
-        if trigger == "consume-first" and ordered:
+        if trigger in _VOLUNTARY_TRIGGERS and ordered:
             # Two-phase commit: the provisional pick may have ridden a
             # snapshot up to CANDIDATE_MAX_INTERVAL_S stale — consume-first
             # decides below the threshold, where the collector only escalates
@@ -1486,14 +1573,30 @@ class AutoSwitchEngine:
                 settings=settings,
                 now=decided_now,
                 thresholds=thresholds,
+                priorities=priorities,
             )
 
-        if not ordered and api_key_candidates and trigger != "consume-first":
+        if not ordered and api_key_candidates and trigger not in _VOLUNTARY_TRIGGERS:
             # Last resort when we must move: metered API-key accounts
             # (unmeasurable headroom). Never for a below-threshold consume-first
             # nudge — those API-key accounts have no weekly window to consume.
             ordered = api_key_candidates
 
+        if not ordered and trigger in ("priority", "soft"):
+            # The provisional pick did not survive the refetch: the active is
+            # still under its hard line, so this is the ordinary hold, never a
+            # block — and it is reported as such, ahead of the census below,
+            # which would read an unreadable refetch as BLOCKED. The next
+            # tick decides again on the data this refetch stored.
+            self._emit(
+                NoSwitchEvent(
+                    reason="below-threshold",
+                    detail=_below_line_detail(
+                        active_binding, active_headroom, thresholds[current]
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
         if not ordered:
             if not any_known:
                 # No candidate readable this tick — true for every strategy,
@@ -1591,7 +1694,7 @@ class AutoSwitchEngine:
         systemic = ""
         for num in ordered:
             email = self.switcher.account_email(num)
-            if trigger == "consume-first":
+            if trigger in _VOLUNTARY_TRIGGERS:
                 # The phase-2 refetch is best-effort: the collector refuses
                 # accounts in failure backoff or claimed by a concurrent
                 # poller, which then serve their stored entries. Consume-first
@@ -1755,6 +1858,16 @@ class AutoSwitchEngine:
             thresholds = ThresholdMap({}, settings.threshold)
         came_from = state.get("lastSwitchFrom")
         if trigger not in ("proactive", "consume-first") or came_from is None:
+            return None
+        # Nor after a VOLUNTARY departure. A `priority` or `soft` move leaves
+        # an account that was still under its hard line, for a reason that is
+        # not headroom; coming back to it once the account we moved to is
+        # spent is the fallback the user configured, not the burn-driven flip
+        # this bar exists for. It cannot flap either: the voluntary move out
+        # again needs its target under its own (soft) line by the hysteresis
+        # margin, which the account just left at/over that line only regains
+        # when a window rolls over.
+        if state.get("leftTrigger") in ("priority", "soft"):
             return None
         # Only while we are still standing where that switch put us. A manual
         # switch away already undid the move, so there is nothing left to
@@ -2094,6 +2207,9 @@ class AutoSwitchEngine:
         # for every account, so a caller without per-account context behaves
         # exactly as this function did before per-account thresholds existed.
         thresholds: Mapping[str, float] | None = None,
+        # Same convention: omitted, every account reads priority 0 and the
+        # ranking is exactly the one from before priorities existed.
+        priorities: Mapping[str, int] | None = None,
     ) -> tuple[list[str], bool, float | None]:
         """Filter and rank OAuth candidates for this tick's trigger.
 
@@ -2104,6 +2220,26 @@ class AutoSwitchEngine:
         """
         if thresholds is None:
             thresholds = ThresholdMap({}, settings.threshold)
+        if priorities is None:
+            priorities = PriorityMap()
+        active_priority = priorities[current]
+        # Each account's soft line, or None where it has none (unset, or at/
+        # above that account's own hard line), and the per-account verdict
+        # against it. An account without a soft line is judged on its hard
+        # line, so "under its soft line" never asks more of it than the
+        # landing gate already does.
+        soft_lines = {
+            num: self._soft_line(num, settings, thresholds)
+            for num in (*oauth_candidates, current)
+        }
+        # Priority and the soft tier only enter the sort key when they can
+        # carry information. With one priority level across the candidates
+        # and no soft line, the key is the strategy's own, unchanged — which
+        # is what keeps a fleet that never configured either ranking exactly
+        # as before.
+        tiered = any(line is not None for line in soft_lines.values()) or (
+            len({priorities[num] for num in oauth_candidates}) > 1
+        )
         # consume-first ranks by soonest weekly reset; a proactive (below-
         # threshold) target must reset strictly sooner than where we are.
         active_reset_ts = (
@@ -2215,7 +2351,27 @@ class AutoSwitchEngine:
                 if all_above
                 else 0.0
             )
-            if trigger in ("proactive", "consume-first"):
+            if trigger in ("priority", "soft"):
+                # Voluntary moves, made while the active is under its hard
+                # line: the target must be of strictly higher priority
+                # (`priority`) or at least the active's (`soft`, which never
+                # trades preference away for room), and under its own soft
+                # line — its hard line where it has none — by the full
+                # hysteresis margin, on fresh data (the two-phase commit). The
+                # margin is what makes the move one-way: the account we leave
+                # is at/over that line (`soft`) or is the lower-priority side
+                # (`priority`), and burning the target back down to the line
+                # takes at least `hysteresis_pct` points of real use.
+                if active_priority > priorities[num] or (
+                    trigger == "priority" and active_priority == priorities[num]
+                ):
+                    continue
+                margin = self._margin_under_line(
+                    usage.get(num), settings, soft_lines[num] or thresholds[num]
+                )
+                if margin is None or margin < settings.hysteresis_pct:
+                    continue
+            elif trigger in ("proactive", "consume-first"):
                 # Landing must be healthy: an account at/over any of its own
                 # lines would re-trigger on the very next tick. At-limit and
                 # failover are escapes that skip this whole block — any account
@@ -2266,7 +2422,9 @@ class AutoSwitchEngine:
                                 and recovery_ts
                                 < active_recovery_ts - RECOVERY_HYSTERESIS_S
                             ):
-                                fallback.append(((0, recovery_ts, -h), num))
+                                fallback.append(
+                                    ((0, recovery_ts, -h, -priorities[num]), num)
+                                )
                             continue
                 elif consume_first:
                     # Purely proactive on reset ordering: below the threshold,
@@ -2278,6 +2436,20 @@ class AutoSwitchEngine:
                         or active_reset_ts is None
                         or reset_ts >= active_reset_ts
                     ):
+                        continue
+                    if trigger == "consume-first" and (
+                        priorities[num] < active_priority
+                        or (
+                            soft_lines[num] is not None
+                            and self._soft_over(usage.get(num), settings, soft_lines[num])
+                        )
+                    ):
+                        # The nudge is voluntary too, so it obeys the same
+                        # two rules as `priority`/`soft`: never toward a
+                        # lower priority, never onto an account at/over its
+                        # soft line. Either landing would be undone by one
+                        # of those triggers on the next tick, and the pair
+                        # would trade places at the cooldown rate.
                         continue
                 elif active_headroom is not None:
                     # best: the candidate must beat the active account by the
@@ -2310,15 +2482,41 @@ class AutoSwitchEngine:
                 # whichever came first in the list. Headroom still decides
                 # first within the tier; the reset only breaks its ties, where
                 # sooner is plainly better than lower slot number.
+                #
+                # Priority deliberately does NOT reorder this regime: with every
+                # account over its line the only question is which comes back
+                # first, and preferring a slower-returning account for its
+                # priority would trade working time for a preference. It only
+                # breaks exact ties, ahead of sequence order.
                 key: tuple = (
-                    (0, recovery_ts, -h) if by_recovery else (1, -h, recovery_ts)
+                    (0, recovery_ts, -h, -priorities[num])
+                    if by_recovery
+                    else (1, -h, recovery_ts, -priorities[num])
                 )
-            elif consume_first:
-                # Soonest weekly reset first (unknown resets sort last), most
-                # policy headroom breaks ties, then sequence order.
-                key = (reset_ts if reset_ts is not None else float("inf"), -lh)
             else:
-                key = (-lh,)
+                if consume_first:
+                    # Soonest weekly reset first (unknown resets sort last),
+                    # most policy headroom breaks ties, then sequence order.
+                    key = (reset_ts if reset_ts is not None else float("inf"), -lh)
+                else:
+                    key = (-lh,)
+                if tiered:
+                    # Over-line last, then priority (higher first), then under
+                    # the soft line first, then the strategy. The over tier
+                    # comes FIRST so priority can never lift an account at/
+                    # over its own line above a healthy one — reachable only
+                    # on at-limit/failover, the escapes that admit such
+                    # candidates at all. The soft tier is what makes a hard
+                    # switch on the last account of a priority level take a
+                    # peer of that level still under its soft line, then any
+                    # peer of that level still under its hard line, before
+                    # dropping a level.
+                    soft_over = (
+                        self._soft_over(usage.get(num), settings, soft_lines[num])
+                        if soft_lines[num] is not None
+                        else over
+                    )
+                    key = (over, -priorities[num], soft_over, *key)
             qualifying.append((key, num))
         # Ascending by the strategy's key; list order (sequence order) breaks ties.
         qualifying = qualifying or fallback
@@ -2511,7 +2709,7 @@ class AutoSwitchEngine:
         # state lock.
         with self._state_lock():
             state = self._read_state()
-            if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
+            if trigger in _COOLDOWN_TRIGGERS and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
@@ -2577,6 +2775,127 @@ class AutoSwitchEngine:
             settings.weekly_threshold,
             scale=settings.threshold,
         )
+
+    @staticmethod
+    def _soft_line(
+        num: str, settings: AutoSwitchSettings, thresholds: Mapping[str, float]
+    ) -> float | None:
+        """This account's soft line, or None when it has none: soft lines are
+        unset, or the account's own hard line (a lower per-account override,
+        a lower session threshold) sits at or under the soft one. With no
+        soft line an account is judged on its hard line alone, so a soft
+        setting can never invert the pair for one account."""
+        soft = settings.soft_threshold
+        if soft is None or soft >= thresholds[num]:
+            return None
+        return soft
+
+    def _line_binding(
+        self, value: dict | str | None, settings: AutoSwitchSettings, line: float
+    ) -> BindingWindow | None:
+        """The binding window with ``line`` in place of the hard threshold and
+        ``line`` itself as the ruler, so ``line_headroom - (100 - line)`` is
+        the distance under that line in plain points on the 5h window. Used
+        for the soft verdict and the voluntary landing margin only — never
+        for the hard-line ranking, which stays on the global ruler."""
+        return binding_window(
+            oauth.relevant_windows(
+                value if isinstance(value, dict) else None, self._models
+            ),
+            line,
+            settings.weekly_threshold,
+            scale=line,
+        )
+
+    def _soft_over(
+        self, value: dict | str | None, settings: AutoSwitchSettings, line: float
+    ) -> bool:
+        """At/over ``line`` (a soft line) on any window it governs. An account
+        reporting no window is not over: the hard-line gates already decide
+        what an unreadable row may do."""
+        binding = self._line_binding(value, settings, line)
+        return binding is not None and binding.over
+
+    def _margin_under_line(
+        self, value: dict | str | None, settings: AutoSwitchSettings, line: float
+    ) -> float | None:
+        """Points under ``line`` on the binding window (the weekly windows
+        keep their own line), or None when the account reports no window or
+        any window is at/over its line. The voluntary triggers require this to
+        reach ``hysteresis_pct``."""
+        binding = self._line_binding(value, settings, line)
+        if binding is None or binding.over:
+            return None
+        return binding.line_headroom - (100.0 - line)
+
+    def _voluntary_trigger(
+        self,
+        current: str,
+        quarantined: set[str],
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+        active_headroom: float | None,
+        settings: AutoSwitchSettings,
+        thresholds: Mapping[str, float],
+        priorities: Mapping[str, int],
+    ) -> str | None:
+        """``"priority"`` or ``"soft"`` when that move has a target on the
+        stored snapshot, else None. Asked only while the active is under its
+        hard line.
+
+        ``priority`` first — a healthy account of strictly higher priority —
+        then ``soft``: the active is at/over its own soft line and an account
+        of at least its priority is under its own. Both are decided here only
+        provisionally; the tick re-ranks on a refetch before committing, as
+        consume-first does.
+
+        Free when unconfigured: with no soft line and no priority above the
+        active's anywhere in the fleet, it returns before reading anything
+        beyond the policy map the tick already holds, so a fleet that never
+        set either decides exactly as before.
+        """
+        active_priority = priorities[current]
+        # The map holds only non-zero priorities, so an active below the
+        # default is outranked by every account the map leaves out.
+        any_higher = active_priority < 0 or any(
+            p > active_priority for p in priorities.values()
+        )
+        active_soft = self._soft_line(current, settings, thresholds)
+        active_soft_over = active_soft is not None and self._soft_over(
+            usage.get(current), settings, active_soft
+        )
+        if not any_higher and not active_soft_over:
+            return None
+        oauth_candidates = [
+            num
+            for num in self.switcher.switchable_account_numbers()
+            if num != current
+            and num not in quarantined
+            and self.switcher.account_kind_for(num) != "api_key"
+        ]
+        if not oauth_candidates:
+            return None
+        now = self.clock()
+        for trigger, wanted in (("priority", any_higher), ("soft", active_soft_over)):
+            if not wanted:
+                continue
+            ordered, _any_known, _reset = self._rank_candidates(
+                trigger=trigger,
+                consume_first=settings.strategy == "consume-first",
+                oauth_candidates=oauth_candidates,
+                no_return=None,
+                usage=usage,
+                headroom=headroom,
+                current=current,
+                active_headroom=active_headroom,
+                settings=settings,
+                now=now,
+                thresholds=thresholds,
+                priorities=priorities,
+            )
+            if ordered:
+                return trigger
+        return None
 
     def _in_cooldown(self, state: dict) -> bool:
         last = state.get("lastSwitchAt")

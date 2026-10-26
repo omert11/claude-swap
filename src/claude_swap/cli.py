@@ -11,7 +11,12 @@ import sys
 from claude_swap import __version__, paths, printer
 from claude_swap.exceptions import ClaudeSwitchError
 from claude_swap.json_output import error_envelope
-from claude_swap.models import ACCOUNT_THRESHOLD_MAX, ACCOUNT_THRESHOLD_MIN
+from claude_swap.models import (
+    ACCOUNT_PRIORITY_MAX,
+    ACCOUNT_PRIORITY_MIN,
+    ACCOUNT_THRESHOLD_MAX,
+    ACCOUNT_THRESHOLD_MIN,
+)
 from claude_swap.printer import (
     accent,
     bolded,
@@ -685,6 +690,113 @@ def _print_threshold_table(switcher: ClaudeAccountSwitcher) -> None:
         print(f"  Account-{num}  {value:g}%")
 
 
+def _priority_command(argv: list[str]) -> None:
+    """Handle `cswap priority [NUM|EMAIL|ALIAS] [INT] [--unset]`.
+
+    The twin of `_threshold_command`: with no arguments, lists every account's
+    priority; otherwise sets (or, with --unset, removes) one account's. Higher
+    is preferred and unset reads as 0. Pre-dispatched before the main parser
+    for the same reason as `alias` and `threshold`.
+
+    The value is validated inside `set_account_priority`, before any file is
+    touched, so a rejected value leaves `sequence.json` byte-identical.
+    """
+    parser = argparse.ArgumentParser(
+        prog="cswap priority",
+        description=(
+            "Set, remove, or list a per-account auto-switch priority. Higher "
+            "is preferred: among the accounts auto-switch would accept anyway, "
+            "the highest priority is taken first, and a healthy account of "
+            "higher priority than the active one is switched back to. Unset "
+            "is 0."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""
+Examples:
+  cswap priority 2 10
+  cswap priority user@example.com -1  # use this account last
+  cswap priority 2 --unset            # back to the default (0)
+  cswap priority                      # list every account's priority
+
+Valid range: {ACCOUNT_PRIORITY_MIN} to {ACCOUNT_PRIORITY_MAX} (integers).
+        """,
+    )
+    parser.add_argument(
+        "account",
+        nargs="?",
+        metavar="NUM|EMAIL",
+        help="Account to set (number, email, or alias). Omit to list.",
+    )
+    parser.add_argument(
+        "priority",
+        nargs="?",
+        metavar="INT",
+        help=(
+            f"Priority, higher preferred "
+            f"({ACCOUNT_PRIORITY_MIN} to {ACCOUNT_PRIORITY_MAX}; 0 clears it)."
+        ),
+    )
+    parser.add_argument(
+        "--unset", action="store_true", help="Remove the account's priority"
+    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+    args = parser.parse_args(argv)
+
+    if args.unset and args.priority is not None:
+        parser.error("--unset does not take an INT argument")
+    if args.unset and args.account is None:
+        parser.error("NUM|EMAIL is required with --unset")
+    if args.account is not None and not args.unset and args.priority is None:
+        parser.error("INT is required (or pass --unset to remove the priority)")
+
+    try:
+        switcher = ClaudeAccountSwitcher(debug=args.debug)
+        _guard_root(switcher)
+
+        if args.account is None:
+            _print_priority_table(switcher)
+            return
+
+        switcher.set_account_priority(
+            args.account, None if args.unset else args.priority
+        )
+    except ValueError as e:
+        # normalize_account_priority's message; it always names the range.
+        error(f"Error: {e}")
+        sys.exit(1)
+    except ClaudeSwitchError as e:
+        error(f"Error: {e}")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f"\n{dimmed('Operation cancelled')}")
+        sys.exit(130)
+
+
+def _print_priority_table(switcher: ClaudeAccountSwitcher) -> None:
+    """Print every account's switch priority, highest first.
+
+    Every managed account is listed, not only the ones with a priority set:
+    priority is relative, so an operator reading it needs to see the accounts
+    sitting at the default 0 that the others are ranked against.
+    """
+    policies = switcher.account_policies()
+    print(bolded("Switch priorities (higher preferred, default 0):"))
+    if not policies:
+        print(dimmed("  No accounts are managed yet"))
+        return
+    rows = sorted(
+        policies.items(),
+        key=lambda row: (
+            -row[1].priority,
+            not row[0].isdigit(),
+            int(row[0]) if row[0].isdigit() else 0,
+        ),
+    )
+    for num, policy in rows:
+        label = f"{policy.priority:>4}" if policy.priority else dimmed(f"{0:>4}")
+        print(f"  Account-{num}  {label}")
+
+
 def _auto_command(argv: list[str]) -> None:
     """Handle `cswap auto [--once] [--json] [...]`.
 
@@ -717,6 +829,7 @@ Examples:
   cswap auto                       # foreground loop, switch at 90% used
   cswap auto --threshold 80        # switch earlier
   cswap auto --weekly-threshold 97 # let the weekly window run higher before switching
+  cswap auto --soft-threshold 60   # prefer accounts under 60%, run to 90% only when none is
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
@@ -759,6 +872,16 @@ Defaults live in settings.json in the backup root; flags override them.
             "Separate switch line for the 7-day and per-model weekly windows "
             "(50-99.9; default: the threshold). A flag cannot unset a "
             "configured value; use 'cswap config unset'"
+        ),
+    )
+    parser.add_argument(
+        "--soft-threshold",
+        type=float,
+        metavar="PCT",
+        help=(
+            "Soft switch line below --threshold: at it, move to an account of "
+            "equal or higher priority still under its own soft line, else "
+            "stay until the threshold (50-99.9; default: off)"
         ),
     )
     parser.add_argument(
@@ -852,6 +975,8 @@ Defaults live in settings.json in the backup root; flags override them.
                 if settings.weekly_threshold is not None
                 else ""
             )
+            if settings.soft_threshold is not None:
+                weekly += f", soft {pct_label(settings.soft_threshold)}%"
             print(
                 dimmed(
                     f"Auto-switch running: threshold {pct_label(settings.threshold)}%"
@@ -913,6 +1038,7 @@ Examples:
   cswap config get autoswitch.threshold
   cswap config set autoswitch.threshold 80
   cswap config set autoswitch.weeklyThreshold 97  # own line for the 7d/per-model windows
+  cswap config set autoswitch.softThreshold 60    # soft line: prefer accounts under it
   cswap config unset autoswitch.threshold   # back to the default
   cswap config path                         # where settings.json lives
         """,
@@ -1144,6 +1270,9 @@ def main() -> None:
     if argv and argv[0] == "threshold":
         _threshold_command(argv[1:])
         return
+    if argv and argv[0] == "priority":
+        _priority_command(argv[1:])
+        return
     if argv and argv[0] == "swap":
         _swap_command(argv[1:])
         return
@@ -1181,6 +1310,9 @@ Commands:
   %(prog)s threshold <num|email> <pct>  set one account's switch-away point
   %(prog)s threshold <num|email> --unset  clear it (use the global default)
   %(prog)s threshold                  list the global default and overrides
+  %(prog)s priority <num|email> <int>  prefer an account in auto-switch
+  %(prog)s priority <num|email> --unset  clear it (back to 0)
+  %(prog)s priority                   list every account's priority
   %(prog)s run <num|email> [-- ...]   run as an account, this terminal only
   %(prog)s run                        run the current dir's mapped account
   %(prog)s map <num|email> [path]     map a directory to an account

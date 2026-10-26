@@ -307,7 +307,8 @@ class AutoScreen(Screen):
         self, snap: AccountsSnapshot, active_number: str | None
     ) -> Text:
         """Switch targets ranked by headroom against their own switch lines
-        (best first) — the engine's own ordering."""
+        (best first), behind priority and the soft line once either is in
+        play — the engine's own hard-switch ordering."""
         # Same window set AND the same lines as the engine: autoswitch.model,
         # each account's own line (its policy threshold, else the session
         # threshold — `_settings` is what `_set_threshold` replaces), the
@@ -319,11 +320,18 @@ class AutoScreen(Screen):
         models = parse_model_names(settings.model) if settings else ()
         threshold = settings.threshold if settings else 90.0
         weekly = settings.weekly_threshold if settings else None
-        ranked: list[tuple[float, str]] = []  # (sort key: -policy headroom, number)
+        soft = settings.soft_threshold if settings else None
+        # Priority and the soft tier order the list only once they can carry
+        # information — the engine's own `tiered` rule — so a fleet that set
+        # neither renders exactly the old headroom order.
+        shown = [
+            acc for acc in snap.accounts
+            if acc.number != active_number and acc.switchable
+        ]
+        tiered = soft is not None or len({acc.policy.priority for acc in shown}) > 1
+        ranked: list[tuple[tuple, str]] = []  # (sort key, number)
         lines: dict[str, Text] = {}
-        for acc in snap.accounts:
-            if acc.number == active_number or not acc.switchable:
-                continue
+        for acc in shown:
             line = (
                 acc.policy.threshold if acc.policy.threshold is not None else threshold
             )
@@ -340,10 +348,10 @@ class AutoScreen(Screen):
                 entry.append(
                     f"  {data.sentinel_label(acc.usage.sentinel)}", style=palette.muted
                 )
-                ranked.append((998.0, acc.number))
+                ranked.append(((1,), acc.number))
             elif binding is None:
                 entry.append("  usage unknown", style=palette.muted)
-                ranked.append((999.0, acc.number))
+                ranked.append(((2,), acc.number))
             else:
                 # The raw pct of the window that binds, and — only once the
                 # lines differ, globally or for this account — the line it is
@@ -356,7 +364,19 @@ class AutoScreen(Screen):
                     entry.append(
                         f" (line {pct_label(binding.line)}%)", style=palette.muted
                     )
-                ranked.append((-binding.line_headroom, acc.number))
+                key: tuple = (-binding.line_headroom,)
+                if tiered:
+                    soft_over = binding.over
+                    if soft is not None and soft < line:
+                        soft_binding = binding_window(
+                            oauth.relevant_windows(acc.usage.last_good, models),
+                            soft,
+                            weekly,
+                            scale=soft,
+                        )
+                        soft_over = soft_binding is not None and soft_binding.over
+                    key = (binding.over, -acc.policy.priority, soft_over, *key)
+                ranked.append(((0, *key), acc.number))
             lines[acc.number] = entry
 
         text = Text()
@@ -364,6 +384,6 @@ class AutoScreen(Screen):
         if not ranked:
             text.append("\n  no other switchable accounts", style=palette.muted)
             return text
-        for _pct, number in sorted(ranked):
+        for _key, number in sorted(ranked):
             text.append(lines[number])
         return text

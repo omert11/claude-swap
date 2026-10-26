@@ -65,6 +65,7 @@ from claude_swap.models import (
     Platform,
     SwitchTransaction,
     get_timestamp,
+    normalize_account_priority,
     normalize_account_threshold,
     normalize_alias,
 )
@@ -1904,7 +1905,8 @@ class ClaudeAccountSwitcher:
         boundary (``set_account_threshold``); by the time a value is in the
         file it may have been hand-edited, and a corrupt record must leave the
         account on the global default rather than crash the auto-switch loop.
-        An unusable threshold reads as ``None``, which is exactly "inherit".
+        An unusable threshold reads as ``None``, which is exactly "inherit";
+        an unusable priority reads as ``0``, the default.
 
         Args:
             data: An already-loaded ``sequence.json`` mapping.
@@ -1928,7 +1930,16 @@ class ClaudeAccountSwitcher:
                 # Hand-edited garbage, out-of-range, NaN/inf: inherit the
                 # global default rather than propagate an unusable number.
                 threshold = None
-        return AccountPolicy(threshold=threshold)
+        raw_priority = record.get("priority")
+        priority = 0
+        if raw_priority is not None:
+            try:
+                priority = normalize_account_priority(raw_priority)
+            except ValueError:
+                # Same degrade rule: an unusable stored priority reads as the
+                # default rather than reordering the fleet on garbage.
+                priority = 0
+        return AccountPolicy(threshold=threshold, priority=priority)
 
     def account_policies(self) -> dict[str, AccountPolicy]:
         """Every managed slot's auto-switch policy, from one sequence read.
@@ -1960,7 +1971,8 @@ class ClaudeAccountSwitcher:
     def _resolve_for_policy_write(self, identifier: str) -> tuple[str, str, dict, dict]:
         """Resolve an identifier and fetch its record, ready for a policy write.
 
-        Called by :meth:`set_account_threshold`. Every
+        Called by :meth:`set_account_threshold` and
+        :meth:`set_account_priority`. Every
         raising path here happens **before** any write, so a rejected call
         leaves ``sequence.json`` byte-identical.
 
@@ -2045,6 +2057,69 @@ class ClaudeAccountSwitcher:
             )
             print(f"{accent('Set')} Account-{account_num} ({email}) "
                   f"threshold to {normalized:g}%.")
+
+    def set_account_priority(self, identifier: str, priority: object | None) -> None:
+        """Set or clear one account's auto-switch priority.
+
+        Higher is preferred. Among the candidates the engine would accept as a
+        landing spot anyway, a higher priority is ranked first; and while the
+        active account is under its own line, a healthy candidate of strictly
+        higher priority is switched back to (the ``priority`` trigger).
+        Priority never makes an account that is over its own lines acceptable.
+
+        ``priority=None`` — or ``0``, the value an account without one already
+        reads as — removes the key rather than writing it, so a fleet that has
+        never set a priority keeps a ``sequence.json`` byte-identical to one
+        from before this feature existed.
+
+        Args:
+            identifier: Slot number, email, or alias.
+            priority: Integer in ``[ACCOUNT_PRIORITY_MIN,
+                ACCOUNT_PRIORITY_MAX]``, or ``None`` to clear.
+
+        Raises:
+            ConfigError: No accounts are managed yet, or the email is ambiguous.
+            AccountNotFoundError: The identifier matches no managed account.
+            ValueError: The value is not an integer in range. Raised *before*
+                any write, so a rejected value leaves the store untouched.
+        """
+        # Validate first, exactly as `set_account_threshold` does.
+        normalized = None if priority is None else normalize_account_priority(priority)
+        if normalized == 0:
+            normalized = None
+
+        account_num, email, data, record = self._resolve_for_policy_write(identifier)
+
+        current = record.get("priority")
+        if normalized is None and "priority" not in record:
+            print(dimmed(
+                f"Account-{account_num} ({email}) has no priority set "
+                f"— already at the default (0)."
+            ))
+            return
+        if normalized is not None and current == normalized:
+            print(dimmed(
+                f"Account-{account_num} ({email}) is already at priority {normalized}."
+            ))
+            return
+
+        if normalized is None:
+            record.pop("priority", None)
+        else:
+            record["priority"] = normalized
+        data["lastUpdated"] = get_timestamp()
+        self._write_json(self.sequence_file, data)
+
+        if normalized is None:
+            self._logger.info(f"Cleared priority for account {account_num}: {email}")
+            print(f"{accent('Cleared')} priority for Account-{account_num} ({email}) "
+                  f"— now at the default (0).")
+        else:
+            self._logger.info(
+                f"Set priority {normalized} for account {account_num}: {email}"
+            )
+            print(f"{accent('Set')} Account-{account_num} ({email}) "
+                  f"priority to {normalized}.")
 
     def set_account_disabled(self, identifier: str, disabled: bool) -> None:
         """Hold an account out of rotation (``disabled=True``) or return it.
