@@ -535,6 +535,152 @@ def build_usage_result(data: dict) -> dict | None:
     return result if result else None
 
 
+# -- live rate-limit probe ----------------------------------------------------
+#
+# The usage endpoint can serve a frozen reading for minutes while it is rate
+# limited (upstream #208, #500): the active account sat at "72%" for eight
+# minutes and then jumped to 100%. The Messages API reports the same unified
+# rate-limit windows on every response, in headers, so one minimal request
+# with the active account's own token reads them live. The request must look
+# like Claude Code's own (identity system prompt + claude-code beta): without
+# them the endpoint answers 429 with no rate-limit headers at all.
+
+LIVE_PROBE_URL = "https://api.anthropic.com/v1/messages"
+#: The cheapest model the probe can ask; one output token is all it spends.
+LIVE_PROBE_MODEL = "claude-haiku-5-5"
+LIVE_PROBE_TIMEOUT_S = 10.0
+_LIVE_PROBE_SYSTEM = "You are Claude Code, Anthropic's official CLI for Claude."
+_LIVE_PROBE_BETA = f"{OAUTH_BETA_HEADER},claude-code-20250219"
+_RATELIMIT_PREFIX = "anthropic-ratelimit-unified"
+# Header window name -> usage-dict key, in `relevant_windows` order.
+_RATELIMIT_WINDOWS = (("5h", "five_hour"), ("7d", "seven_day"))
+_RATELIMIT_CLAIMS = {"five_hour": "five_hour", "seven_day": "seven_day"}
+
+
+@dataclass(frozen=True)
+class LiveProbeOutcome:
+    """Result of one live rate-limit probe.
+
+    ``windows`` maps ``"five_hour"`` / ``"seven_day"`` to a usage-window dict
+    in ``build_usage_result``'s shape (``pct`` in percent, ``resets_at`` ISO),
+    holding only the windows the response reported — a Team account sends no
+    7d headers, and the caller keeps its stored value for whatever is absent.
+    ``error`` is ``None`` on success, else a ``_classify_usage_error`` kind
+    (or ``"no-ratelimit-headers"``); the probe never raises.
+    """
+
+    windows: dict[str, dict] | None
+    error: str | None = None
+    retry_after_s: float | None = None
+
+
+def request_live_ratelimit(access_token: str) -> tuple[int, object]:
+    """POST one minimal Messages request; return ``(status, headers)``.
+
+    A 429 is returned rather than raised: an at-limit account answers 429
+    WITH the rate-limit headers (status ``rejected``), which is exactly the
+    reading wanted. Every other HTTP error and every transport error raises.
+    """
+    body = json.dumps({
+        "model": LIVE_PROBE_MODEL,
+        "max_tokens": 1,
+        "system": [{"type": "text", "text": _LIVE_PROBE_SYSTEM}],
+        "messages": [{"role": "user", "content": "hi"}],
+    }).encode()
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": _LIVE_PROBE_BETA,
+        "Content-Type": "application/json",
+        "User-Agent": "claude-cli/2.1.0 (external, cli)",
+        "x-app": "cli",
+    }
+    req = urllib.request.Request(
+        LIVE_PROBE_URL, data=body, headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=LIVE_PROBE_TIMEOUT_S) as resp:
+            return resp.status, resp.headers
+    except urllib.error.HTTPError as e:
+        if e.code == 429 and e.headers is not None:
+            return 429, e.headers
+        raise
+
+
+def _epoch_to_iso(raw: str | None) -> str | None:
+    try:
+        ts = float(raw) if raw is not None else None
+    except ValueError:
+        return None
+    if ts is None or ts <= 0:
+        return None
+    return (
+        datetime.fromtimestamp(ts, tz=timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def parse_ratelimit_headers(headers: object) -> dict[str, dict]:
+    """Usage windows from ``anthropic-ratelimit-unified-*`` headers.
+
+    Utilization arrives as a fraction (``0.26``) and is stored in percent,
+    like the usage endpoint's. A window whose own status is ``rejected`` is
+    at its limit whatever its utilization says, and so is the window the
+    overall status names through ``representative-claim`` when the overall
+    status is ``rejected`` (the 5h window when it names none). A window with
+    no utilization header is left out, so the caller keeps its stored value.
+    """
+    get = getattr(headers, "get", None)
+    if get is None:
+        return {}
+    windows: dict[str, dict] = {}
+    for name, key in _RATELIMIT_WINDOWS:
+        raw = get(f"{_RATELIMIT_PREFIX}-{name}-utilization")
+        status = (get(f"{_RATELIMIT_PREFIX}-{name}-status") or "").strip().lower()
+        try:
+            pct = float(raw) * 100.0 if raw is not None else None
+        except ValueError:
+            pct = None
+        if status == "rejected":
+            pct = 100.0
+        if pct is None:
+            continue
+        entry: dict = {"pct": pct}
+        resets_at = _epoch_to_iso(get(f"{_RATELIMIT_PREFIX}-{name}-reset"))
+        if resets_at:
+            entry["resets_at"] = resets_at
+            entry["countdown"], entry["clock"] = format_reset(resets_at)
+        windows[key] = entry
+    overall = (get(f"{_RATELIMIT_PREFIX}-status") or "").strip().lower()
+    if overall == "rejected":
+        claim = (get(f"{_RATELIMIT_PREFIX}-representative-claim") or "").strip().lower()
+        key = _RATELIMIT_CLAIMS.get(claim, "five_hour")
+        windows.setdefault(key, {})["pct"] = 100.0
+    return windows
+
+
+def probe_live_usage(access_token: str) -> LiveProbeOutcome:
+    """Read the account's 5h/7d windows from one live Messages request.
+
+    Never raises and never logs the token: a failure is returned as a kind
+    for the caller to back off on, logged here at DEBUG only — the stored
+    reading still serves, so a failed probe is not worth a WARNING.
+    """
+    try:
+        status, headers = request_live_ratelimit(access_token)
+    except Exception as e:
+        kind, retry_after = _classify_usage_error(e)
+        _logger.debug("Live usage probe failed: %s (%r)", kind, type(e).__name__)
+        return LiveProbeOutcome(None, error=kind, retry_after_s=retry_after)
+    windows = parse_ratelimit_headers(headers)
+    if not windows:
+        kind = "http-429" if status == 429 else "no-ratelimit-headers"
+        _logger.debug("Live usage probe returned no rate-limit headers (%s)", status)
+        return LiveProbeOutcome(None, error=kind)
+    return LiveProbeOutcome(windows)
+
+
 # Label of the 5-hour window as ``relevant_windows`` reports it. The only
 # window that is NOT weekly: every consumer that treats the 5h window
 # differently (``lines.window_line``, the TUI's per-row switch-line tick) keys

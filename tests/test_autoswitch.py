@@ -454,17 +454,18 @@ class TestDecisionTable:
         )
         assert exhausted.earliest_reset_at == reset
 
-    def test_cooldown_suppresses_proactive(self, harness):
+    def test_proactive_bypasses_cooldown(self, harness):
+        """Over the hard line the cooldown does not hold the active account:
+        it only spaces out voluntary moves (see `_COOLDOWN_TRIGGERS`)."""
         harness.engine._mutate_state(
             lambda s: s.update(lastSwitchAt=harness.clock() - 10)
         )
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": _usage(10), "3": _usage(10),
         })
-        assert outcome is TickOutcome.NO_ACTION
-        assert [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)] == [
-            "cooldown"
-        ]
+        assert outcome is TickOutcome.SWITCHED
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
 
     def test_at_limit_bypasses_cooldown(self, harness):
         harness.engine._mutate_state(

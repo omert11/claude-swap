@@ -19,8 +19,9 @@ still valid while a running Claude Code picks the new one up (this is what
 makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
 below every one of their lines and beat the active account by
 ``hysteresis_pct`` points so two accounts hovering at a line never
-ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate (bypassed
-only when the active account is hard at its limit). Physical questions —
+ping-pong, and a ``cooldown_seconds`` floor bounds the rate of the
+*voluntary* moves (consume-first, priority, soft) — a switch forced by a hard
+line, the active's limit, or failover never waits on it. Physical questions —
 exhausted, at its limit, when does quota return — read the raw percentages. Before
 activation the target's token is *freshened* (refreshed if it expires within
 10 minutes — twice Claude Code's refresh buffer, so a running Claude Code's
@@ -39,6 +40,11 @@ active account at/over it move to an account of equal or higher priority
 still under its own soft line (the ``soft`` trigger), and otherwise stay
 until the hard line; the hard-switch ranking then prefers candidates still
 under their soft line.
+
+With ``settings.live_probe`` on, the active account's 5h/7d windows are read
+live from one minimal Messages request whenever its stored reading is near
+the line the next decision turns on, or stale (``_live_probe``), so a usage
+endpoint serving a frozen number cannot hold the engine on a spent account.
 
 Cooldown and quarantine persist in ``<backup_root>/autoswitch_state.json``
 (so cron-driven ``cswap auto --once`` ticks behave across processes), mutated
@@ -73,7 +79,7 @@ from claude_swap.poll_policy import (
 )
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
-from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
+from claude_swap.usage_store import UsageEntry, due_candidate, plan_oversleeps_interval
 
 STATE_FILENAME = "autoswitch_state.json"
 STATE_SCHEMA_VERSION = 1
@@ -176,9 +182,31 @@ SPENT_HEADROOM_PCT = 3.0
 # back to an API-key account. `consume-first` is the original member;
 # `priority` and `soft` reuse its two-phase commit unchanged.
 _VOLUNTARY_TRIGGERS = ("consume-first", "priority", "soft")
-# Triggers the cooldown floor applies to: the voluntary ones plus `proactive`.
-# At-limit and failover are escapes and bypass it.
-_COOLDOWN_TRIGGERS = ("proactive", *_VOLUNTARY_TRIGGERS)
+# Triggers the cooldown floor applies to: the voluntary ones only. Every
+# other trigger means the active account is at/over a hard line (`proactive`,
+# `at-limit`) or unreadable (`failover`), and holding there burns the window
+# the line exists to protect — measured: a 300s cooldown held an account from
+# 91% to 100% before the at-limit escape fired. Anti-flap on those paths is
+# already structural: the landing gate refuses any target at/over its own
+# lines, `hysteresis_pct` (or the recovery hysteresis when everything is over)
+# makes each move one-way, and the no-return bar refuses to undo the last
+# move until the account left has genuinely recovered.
+_COOLDOWN_TRIGGERS = _VOLUNTARY_TRIGGERS
+
+# Live probe (``settings.live_probe``): the active account is read live when
+# any of its stored windows is within this many points of the line the next
+# decision turns on (its soft line where it has one, else its hard line; the
+# weekly windows keep the weekly line) — the same width as poll_policy's
+# urgent band — or when its stored reading is older than this many poll
+# intervals. Anywhere else the stored reading is trusted, so the request
+# count stays bounded by the time spent near a line.
+LIVE_PROBE_MARGIN_PCT = 15.0
+LIVE_PROBE_STALE_INTERVALS = 2.0
+# After a failed probe, skip probing for this long, doubling per consecutive
+# failure up to the cap; a server Retry-After that is longer wins. The stored
+# reading serves meanwhile, exactly as it does with the probe off.
+LIVE_PROBE_BACKOFF_S = 60.0
+LIVE_PROBE_BACKOFF_MAX_S = 600.0
 
 
 def _recovery_is_useful(
@@ -363,6 +391,9 @@ class PollEvent(AutoSwitchEvent):
     # only when set. Every pct above stays RAW: the lines are applied where
     # the engine compares, never to the numbers it logs.
     weekly_threshold: float | None = None
+    # The active account's windows came from this tick's live probe rather
+    # than the usage endpoint. Additive field, emitted only when true.
+    live: bool = False
 
     def _fields(self) -> dict:
         fields = {
@@ -376,6 +407,8 @@ class PollEvent(AutoSwitchEvent):
             fields["windowsPct"] = self.windows
         if self.weekly_threshold is not None:
             fields["weeklyThreshold"] = self.weekly_threshold
+        if self.live:
+            fields["liveProbe"] = True
         return fields
 
     def _describe(self, num: str) -> str:
@@ -407,6 +440,8 @@ class PollEvent(AutoSwitchEvent):
             )
             used = f"{binding.label} {binding.pct:.0f}% used"
             line = binding.line
+            if self.live:
+                used += " (live)"
         elif h is not None:
             used = f"{100 - h:.0f}% used"
         else:
@@ -813,6 +848,13 @@ class AutoSwitchEngine:
         # warned) on the first tick where every relevant account has readable
         # usage — adaptive polling legitimately leaves gaps before that.
         self._model_check_done = not self._models
+        # Live probe: consecutive failures and the backoff they earned
+        # (in-memory — a probe is an optimisation, never state worth a write),
+        # and this tick's live-probed active entry, overlaid on every refetch
+        # in the tick so the usage endpoint cannot hand back the frozen value.
+        self._probe_failures = 0
+        self._probe_backoff_until: float | None = None
+        self._live_entry: UsageEntry | None = None
 
     # -- state file ---------------------------------------------------------
 
@@ -1182,6 +1224,7 @@ class AutoSwitchEngine:
         self._mutate_state(store)
 
     def _tick_inner(self) -> TickOutcome:
+        self._live_entry = None
         self._sleep_until_ts = None
         self._blocked_wait_long = False
         self._idle_hold_slow = False
@@ -1253,6 +1296,11 @@ class AutoSwitchEngine:
             quarantined,
             threshold=thresholds[current],
             weekly_threshold=settings.weekly_threshold,
+            # The line the next decision turns on: the soft line where the
+            # active has one, else its hard line.
+            probe_line=(
+                self._soft_line(current, settings, thresholds) or thresholds[current]
+            ),
         )
         self._emit(
             PollEvent(
@@ -1263,6 +1311,7 @@ class AutoSwitchEngine:
                 # gate below actually used, or the UI contradicts the engine.
                 threshold=thresholds[current],
                 weekly_threshold=settings.weekly_threshold,
+                live=self._live_entry is not None,
                 fetch_errors={
                     num: entry.last_error
                     for num, entry in entries.items()
@@ -1555,8 +1604,15 @@ class AutoSwitchEngine:
             # deliberately NOT re-classified if the fresh active crossed the
             # threshold: a still-qualifying sooner target switches anyway,
             # and otherwise the next tick escalates normally and escapes.
-            entries = self.switcher.usage_entries_by_account(
-                fetch={current, *candidates}
+            entries = self._overlay_live(
+                self.switcher.usage_entries_by_account(
+                    fetch=(
+                        {*candidates}
+                        if self._live_entry is not None
+                        else {current, *candidates}
+                    )
+                ),
+                current,
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
             headroom = _headroom_by_account(usage, self._models)
@@ -2532,6 +2588,7 @@ class AutoSwitchEngine:
         *,
         threshold: float | None = None,
         weekly_threshold: float | None = None,
+        probe_line: float | None = None,
     ) -> tuple[dict, dict[str, dict | str | None], dict[str, float | None]]:
         """Two-phase usage collection with an O(1) baseline.
 
@@ -2562,6 +2619,11 @@ class AutoSwitchEngine:
         idle-hold no candidate is polled at all (slow crawl for everything).
         Adapted cadences are persisted by the collector itself after each
         fetch (shared with every other surface), not by the engine.
+
+        With ``settings.live_probe`` on, the active account may be read live
+        between the two phases (``_live_probe``), so the escalation decision
+        and everything after it run on that reading; ``probe_line`` is the
+        line the probe gates on (default: ``threshold``).
 
         Returns ``(entries, usage, headroom)`` where ``usage`` carries
         decision values and ``headroom`` the derived headroom per account.
@@ -2637,6 +2699,20 @@ class AutoSwitchEngine:
         if threshold is None:
             threshold = self.settings.threshold
             weekly_threshold = self.settings.weekly_threshold
+        live = self._live_probe(
+            current,
+            entries,
+            probe_line if probe_line is not None else threshold,
+            weekly_threshold,
+        )
+        if live is not None:
+            entries = self._overlay_live(entries, current)
+            usage[current] = live.decision_value()
+            active_value = usage[current]
+            active_headroom = oauth.account_headroom(
+                active_value if isinstance(active_value, dict) else None,
+                self._models,
+            )
         # Any window of the active within the margin of ITS OWN line: a 5h
         # window closing on its line under a flat, higher weekly window is a
         # switch that is near, whatever the binding max says. With one line
@@ -2652,7 +2728,12 @@ class AutoSwitchEngine:
             or (active_headroom is not None and near_a_line)
         )
         if escalate:
-            escalation_fetch = {current, *candidates}
+            # A live-probed active is not refetched: it is fresher than
+            # anything the usage endpoint can return, and that endpoint is
+            # the source the probe exists to second-guess.
+            escalation_fetch = (
+                {*candidates} if live is not None else {current, *candidates}
+            )
             # Escalation may beat ordinary candidate plans to obtain a fresh
             # switch decision, but a decision-trusted exhausted row cannot be
             # a target. Preserve any wider post-429 plan instead of refetching
@@ -2673,13 +2754,107 @@ class AutoSwitchEngine:
                     and planned_headroom <= 0
                 ):
                     escalation_fetch.remove(num)
-            entries = self.switcher.usage_entries_by_account(
-                fetch=escalation_fetch
+            entries = self._overlay_live(
+                self.switcher.usage_entries_by_account(fetch=escalation_fetch),
+                current,
             )
             usage = {num: entry.decision_value() for num, entry in entries.items()}
 
         headroom = _headroom_by_account(usage, self._models)
         return entries, usage, headroom
+
+    def _live_probe(
+        self,
+        current: str,
+        entries: Mapping[str, UsageEntry],
+        line: float,
+        weekly_threshold: float | None,
+    ) -> UsageEntry | None:
+        """Read the active account live when its stored reading is near
+        ``line`` or stale; return the overlaid entry, or None to keep the
+        stored one.
+
+        Gated three ways, all cheap and none of them a network call: the
+        setting, the stored reading (a window within ``LIVE_PROBE_MARGIN_PCT``
+        of its own line — ``line`` for the 5h window, the weekly line for the
+        weekly ones — or a reading older than ``LIVE_PROBE_STALE_INTERVALS``
+        poll intervals), and the failure backoff. A sentinel row (expired
+        token, locked keychain, ...) is never probed: its own recovery path
+        owns it.
+
+        The probed windows replace only the 5h/7d windows the response
+        reported, merged over the stored row (a Team account's missing 7d
+        keeps its stored value; scoped and spend windows are untouched), and
+        are persisted as a fresh success — except under ``dry_run``, which
+        writes nothing. Never raises: any failure is a debug line and a
+        backoff, and the tick decides on the stored reading as it would with
+        the probe off.
+        """
+        settings = self.settings
+        if not settings.live_probe:
+            return None
+        entry = entries.get(current)
+        if entry is None or entry.sentinel is not None:
+            return None
+        now = self.clock()
+        if self._probe_backoff_until is not None and now < self._probe_backoff_until:
+            return None
+        stale = (
+            entry.age_s is None
+            or entry.age_s > LIVE_PROBE_STALE_INTERVALS * settings.interval_seconds
+        )
+        near = any(
+            pct >= window_line(label, line, weekly_threshold) - LIVE_PROBE_MARGIN_PCT
+            for label, pct, _ in oauth.relevant_windows(entry.last_good)
+        )
+        if not (stale or near):
+            return None
+        try:
+            outcome = self.switcher.probe_active_usage(current)
+        except Exception as e:  # a probe must never take the tick down
+            _logger.debug("Live usage probe raised: %r", type(e).__name__)
+            outcome = oauth.LiveProbeOutcome(None, error=type(e).__name__)
+        if outcome is None:
+            return None              # no usable token: nothing was sent
+        if outcome.windows is None:
+            self._probe_failures += 1
+            backoff = min(
+                LIVE_PROBE_BACKOFF_S * 2 ** (self._probe_failures - 1),
+                LIVE_PROBE_BACKOFF_MAX_S,
+            )
+            if outcome.retry_after_s is not None:
+                backoff = max(backoff, outcome.retry_after_s)
+            self._probe_backoff_until = now + backoff
+            _logger.debug(
+                "Live usage probe failed (%s); backing off %.0fs",
+                outcome.error, backoff,
+            )
+            return None
+        self._probe_failures = 0
+        self._probe_backoff_until = None
+        merged = dict(entry.last_good) if isinstance(entry.last_good, dict) else {}
+        for key, window in outcome.windows.items():
+            previous = merged.get(key)
+            merged[key] = {**(previous if isinstance(previous, dict) else {}), **window}
+        if not self.dry_run:
+            self.switcher.record_live_usage(current, merged)
+        self._live_entry = replace(
+            entry,
+            last_good=merged,
+            fetched_at=now,
+            age_s=0.0,
+            trust_extended=False,
+            last_error=None,
+        )
+        return self._live_entry
+
+    def _overlay_live(
+        self, entries: Mapping[str, UsageEntry], current: str
+    ) -> dict[str, UsageEntry]:
+        """``entries`` with this tick's live-probed active entry in place."""
+        if self._live_entry is None:
+            return dict(entries)
+        return {**entries, current: self._live_entry}
 
     def _perform(
         self,

@@ -77,6 +77,11 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # Read the ACTIVE account's 5h/7d windows live, from the rate-limit
+    # headers of one minimal Messages request, on ticks where its stored
+    # reading is near a switch line or stale — the usage endpoint can serve a
+    # frozen number for minutes while it is rate limited. Off by default.
+    live_probe: bool = False
 
 
 @dataclass(frozen=True)
@@ -153,7 +158,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "cooldownSeconds", "cooldown_seconds", "float", 0.0, 86400.0,
-            help="Minimum seconds between proactive switches",
+            help="Minimum seconds between voluntary switches (soft, priority, consume-first)",
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
@@ -175,6 +180,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "liveProbe", "live_probe", "bool",
+            help="Near a switch line, read the active account's usage live (one tiny request)",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
@@ -539,6 +548,7 @@ def merged_with_cli(settings: AutoSwitchSettings, args) -> AutoSwitchSettings:
         ("include_api_key_accounts", "include_api_key_accounts"),
         ("model", "model"),
         ("strategy", "strategy"),
+        ("live_probe", "live_probe"),
     ):
         value = getattr(args, attr, None)
         if value is not None:

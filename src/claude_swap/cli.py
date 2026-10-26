@@ -830,6 +830,7 @@ Examples:
   cswap auto --threshold 80        # switch earlier
   cswap auto --weekly-threshold 97 # let the weekly window run higher before switching
   cswap auto --soft-threshold 60   # prefer accounts under 60%, run to 90% only when none is
+  cswap auto --live-probe          # read the active account live near a switch line
   cswap auto --model Fable         # also switch when the Fable weekly limit is hit
   cswap auto --json                # one JSON event per line (for scripts)
   cswap auto --once; echo $?       # single tick, outcome in exit code
@@ -888,7 +889,10 @@ Defaults live in settings.json in the backup root; flags override them.
         "--cooldown",
         type=float,
         metavar="SECONDS",
-        help="Minimum time between proactive switches (default 300)",
+        help=(
+            "Minimum time between voluntary switches (soft, priority, "
+            "consume-first); a hard-line switch never waits (default 300)"
+        ),
     )
     parser.add_argument(
         "--model",
@@ -917,6 +921,17 @@ Defaults live in settings.json in the backup root; flags override them.
             "Target selection: 'best' (most quota left; default) or "
             "'consume-first' (proactively use the account whose weekly window "
             "resets soonest)"
+        ),
+    )
+    parser.add_argument(
+        "--live-probe",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "When the active account nears a switch line (or its stored "
+            "usage is stale), read its 5h/7d usage live from one minimal "
+            "Messages request instead of trusting the usage endpoint "
+            "(default: off)"
         ),
     )
     parser.add_argument(

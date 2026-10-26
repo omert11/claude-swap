@@ -1757,6 +1757,44 @@ class ClaudeAccountSwitcher:
         """
         return self._usage_by_account()
 
+    def probe_active_usage(self, account_num: str) -> oauth.LiveProbeOutcome | None:
+        """Live 5h/7d reading for the ACTIVE account (``oauth.probe_live_usage``).
+
+        Reads the live credential once and spends its access token on one
+        minimal Messages request. Returns None — no request made — when the
+        slot is not the active one, or its token is missing or expired: the
+        probe never refreshes, because the active credential belongs to
+        Claude Code and the usage collector already owns that recovery path.
+        """
+        if self.current_account_number() != str(account_num):
+            return None
+        active = self._read_active_credentials()
+        data = oauth.extract_oauth_data(active.value or "")
+        token = data.get("accessToken") if data else None
+        if not token or oauth.is_oauth_token_expired(data.get("expiresAt")):
+            return None
+        return oauth.probe_live_usage(token)
+
+    def record_live_usage(self, account_num: str, usage: dict) -> bool:
+        """Persist a live-probed reading as the slot's fresh last-good.
+
+        The same ``UsageStore.record`` success write a usage fetch makes, so
+        ``cswap list``, the TUI and every other collector serve it, marked
+        fresh. Unfenced: it defers to another collector's live lease rather
+        than overwrite a fetch in flight. Returns whether the store took it.
+        """
+        data = self._get_sequence_data() or {}
+        record = data.get("accounts", {}).get(str(account_num)) or {}
+        email = record.get("email")
+        if not email:
+            return False
+        identity = (email, record.get("organizationUuid", "") or "")
+        accepted = self._usage_store.record(
+            {str(account_num): FetchRecord(usage=usage)},
+            {str(account_num): identity},
+        )
+        return str(account_num) in accepted
+
     def usage_entries_by_account(
         self, fetch: set[str] | None = None, *, scheduled: bool = False
     ) -> dict[str, UsageEntry]:
