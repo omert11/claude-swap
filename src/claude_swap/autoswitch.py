@@ -709,6 +709,11 @@ def _binding_recovery_ts(
     return ts if ts is not None and ts > now else float("inf")
 
 
+# Priority given to a drain-before-reset account: above any stored priority
+# (``cswap priority`` accepts -100..100), plus its rank among drain accounts.
+DRAIN_PRIORITY_BASE = 1000
+
+
 class ThresholdMap(dict):
     """Effective switch threshold per account number — total by construction.
 
@@ -735,6 +740,10 @@ class PriorityMap(dict):
     at all) reads ``0``, so the ranking subscripts directly and a fleet that
     never set a priority ranks exactly as it did before priorities existed.
     """
+
+    # Accounts boosted by drain-before-reset this tick (see
+    # ``AutoSwitchEngine._apply_drain``): they also run without a soft line.
+    drain: frozenset[str] = frozenset()
 
     def __missing__(self, key: str) -> int:
         return 0
@@ -1107,6 +1116,47 @@ class AutoSwitchEngine:
             {num: policy.priority for num, policy in policies.items() if policy.priority}
         )
 
+    def _apply_drain(
+        self,
+        priorities: PriorityMap,
+        usage: Mapping[str, dict | str | None],
+        quarantined: set[str],
+        settings: AutoSwitchSettings,
+        thresholds: Mapping[str, float],
+    ) -> PriorityMap:
+        """Drain-before-reset (``settings.drain_hours``): every OAuth account
+        whose weekly window resets within that many hours and that is still
+        under its hard lines outranks every stored priority, the soonest reset
+        highest, and is marked in ``drain`` so it runs without a soft line.
+        Over a hard line it drops back to its stored priority until the window
+        recovers, so the hard-switch ranking leaves it like any other account.
+        """
+        if settings.drain_hours <= 0:
+            return priorities
+        now = self.clock()
+        horizon = now + settings.drain_hours * 3600.0
+        due: list[tuple[float, str]] = []
+        for num in self.switcher.switchable_account_numbers():
+            if num in quarantined or self.switcher.account_kind_for(num) == "api_key":
+                continue
+            value = usage.get(num)
+            reset_ts = _seven_day_reset_ts(value, now)
+            if reset_ts is None or reset_ts > horizon:
+                continue
+            binding = self._binding(value, settings, thresholds[num])
+            if binding is None or binding.over:
+                continue
+            due.append((reset_ts, num))
+        if not due:
+            return priorities
+        due.sort()
+        boosted = PriorityMap(priorities)
+        for rank, (_reset_ts, num) in enumerate(due):
+            boosted[num] = DRAIN_PRIORITY_BASE + len(due) - rank
+        boosted.drain = frozenset(num for _reset_ts, num in due)
+        _logger.debug("drain-before-reset: %s", ", ".join(num for _r, num in due))
+        return boosted
+
     def _min_effective_threshold(
         self, thresholds: ThresholdMap | None = None
     ) -> float:
@@ -1299,8 +1349,14 @@ class AutoSwitchEngine:
             # The line the next decision turns on: the soft line where the
             # active has one, else its hard line.
             probe_line=(
-                self._soft_line(current, settings, thresholds) or thresholds[current]
+                active_soft
+                if (active_soft := self._soft_line(current, settings, thresholds))
+                is not None
+                else thresholds[current]
             ),
+        )
+        priorities = self._apply_drain(
+            priorities, usage, quarantined, settings, thresholds
         )
         self._emit(
             PollEvent(
@@ -2285,7 +2341,11 @@ class AutoSwitchEngine:
         # line, so "under its soft line" never asks more of it than the
         # landing gate already does.
         soft_lines = {
-            num: self._soft_line(num, settings, thresholds)
+            num: (
+                None
+                if num in getattr(priorities, "drain", ())
+                else self._soft_line(num, settings, thresholds)
+            )
             for num in (*oauth_candidates, current)
         }
         # Priority and the soft tier only enter the sort key when they can
@@ -2423,7 +2483,9 @@ class AutoSwitchEngine:
                 ):
                     continue
                 margin = self._margin_under_line(
-                    usage.get(num), settings, soft_lines[num] or thresholds[num]
+                    usage.get(num),
+                    settings,
+                    soft_lines[num] if soft_lines[num] is not None else thresholds[num],
                 )
                 if margin is None or margin < settings.hysteresis_pct:
                     continue
@@ -3035,7 +3097,11 @@ class AutoSwitchEngine:
         any_higher = active_priority < 0 or any(
             p > active_priority for p in priorities.values()
         )
-        active_soft = self._soft_line(current, settings, thresholds)
+        active_soft = (
+            None
+            if current in getattr(priorities, "drain", ())
+            else self._soft_line(current, settings, thresholds)
+        )
         active_soft_over = active_soft is not None and self._soft_over(
             usage.get(current), settings, active_soft
         )

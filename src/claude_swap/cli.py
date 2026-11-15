@@ -1054,6 +1054,7 @@ Examples:
   cswap config set autoswitch.threshold 80
   cswap config set autoswitch.weeklyThreshold 97  # own line for the 7d/per-model windows
   cswap config set autoswitch.softThreshold 60    # soft line: prefer accounts under it
+  cswap config set autoswitch.drainHours 12       # use an account alone while its weekly reset is <12h away
   cswap config unset autoswitch.threshold   # back to the default
   cswap config path                         # where settings.json lives
         """,

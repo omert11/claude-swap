@@ -82,6 +82,12 @@ class AutoSwitchSettings:
     # reading is near a switch line or stale — the usage endpoint can serve a
     # frozen number for minutes while it is rate limited. Off by default.
     live_probe: bool = False
+    # Drain-before-reset: an account whose weekly (7d) window resets within
+    # this many hours, and that is still under its hard lines, outranks every
+    # priority and ignores its soft line, so its perishable weekly quota is
+    # spent before it resets. Several qualifying: the soonest reset first.
+    # 0 (default) turns it off.
+    drain_hours: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -184,6 +190,10 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "liveProbe", "live_probe", "bool",
             help="Near a switch line, read the active account's usage live (one tiny request)",
+        ),
+        SettingSpec(
+            "autoswitch", "drainHours", "drain_hours", "float", 0.0, 168.0,
+            help="Use an account exclusively while its weekly reset is this close (0: off)",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),
